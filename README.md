@@ -38,15 +38,17 @@ They're optional until a module needs them. Put them in `.env.local` (never comm
 
 ## Commands
 
-| Command                              | What it does                                          |
-| ------------------------------------ | ----------------------------------------------------- |
-| `npm run dev`                        | Start the dev server                                  |
-| `npm test`                           | Run the app's tests                                   |
-| `npm run lint` / `npm run typecheck` | Check code style and types                            |
-| `npm run format`                     | Format the code with Prettier                         |
-| `npm run start-module`               | One-time setup after cloning a module branch          |
-| `npm run env:check`                  | List the variables in `.env.local`, values masked     |
-| `npm run embed-docs`                 | Re-embed the PDFs in `public/docs/` after they change |
+| Command                              | What it does                                           |
+| ------------------------------------ | ------------------------------------------------------ |
+| `npm run dev`                        | Start the dev server                                   |
+| `npm test`                           | Run the app's tests                                    |
+| `npm run lint` / `npm run typecheck` | Check code style and types                             |
+| `npm run format`                     | Format the code with Prettier                          |
+| `npm run start-module`               | One-time setup after cloning a module branch           |
+| `npm run env:check`                  | List the variables in `.env.local`, values masked      |
+| `npm run embed-docs`                 | Re-embed the PDFs in `public/docs/` after they change  |
+| `npm run keys`                       | Module 5: save the keys in `.env.local` and GitHub     |
+| `npm run eval`                       | Module 5: golden-set eval with an AI judge in Langfuse |
 
 ## AI coding agents
 

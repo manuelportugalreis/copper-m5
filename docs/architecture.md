@@ -171,3 +171,38 @@ the tests and a golden-set evaluation with an AI judge run in GitHub Actions
 on every pull request, with `main` protected; every AI call is traced in
 Langfuse; and one support agent that does everything is compared with the two
 agents on the same golden set. Langfuse is the only eval and monitoring tool.
+
+## Module 5: safe to ship
+
+**Observability (`lib/ai/trace.ts`):** with the Langfuse keys set, every
+answer is one Langfuse trace (`ask-copper`), with each agent (Copper, Refund
+agent or Support agent) as an agent observation, its tool calls as tool
+observations, and every model call as a generation with its tokens, cost and
+time (`lib/ai/call.ts` creates them, next to the `[ai_calls]` log line).
+Embeddings and the eval judge are traced too. Without the keys nothing is sent.
+
+**One agent vs two (`lib/copper/assistant/ask.ts`):** `agents: "one"` (or
+`COPPER_AGENTS=one`) swaps Copper and the Refund agent for a single Support
+agent with every tool (`supportAgentTools`, `SUPPORT_AGENT_INSTRUCTIONS`) and
+no handoff. The app ships with two agents.
+
+**Evals (`lib/evals/`, `evals/golden-set.eval.ts`, `npm run eval`):** the
+golden set is 12 Support-page questions, each with what a good answer does,
+the tools it must call and, for refunds, the decision the app must make. Each
+setup runs the set as a Langfuse experiment on the `copper-golden-set`
+dataset, so the runs compare side by side in Langfuse. Scores per answer:
+`judge` (an AI judge, Gemini through `callObject`), `tools` (hard checks in
+code), `passed` (both), `cost_usd` and `latency_s`; per run: `pass_rate`,
+`avg_cost_usd`, `avg_latency_s`. The eval fails when two agents pass fewer
+than 80% (`EVAL_PASS_RATE`).
+
+**CI (`.github/workflows/ci.yml`):** on every pull request, `check` runs lint,
+typecheck, tests and build on Linux, macOS and Windows, and `evals` runs the
+golden set with the keys from the repo's Actions secrets and writes the scores
+to the check's summary. `main` is protected: changes go in through a pull
+request whose checks pass. `npm run keys` saves the keys in `.env.local` and
+in the Actions secrets.
+
+**Risks and open questions:** the judge is itself a model and can be wrong, so
+each case also has hard checks in code. A free Gemini key is rate limited, so
+the eval runs two answers at a time.

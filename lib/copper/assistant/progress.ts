@@ -2,12 +2,27 @@
 // summaries, each tool call (with what went in and what came out), and the
 // reply. The panel draws this as it changes.
 
-/** Who is answering: Copper, or the Refund agent after a handoff (Module 4). */
-export type Agent = "copper" | "refund";
+/**
+ * Who is answering: Copper, or the Refund agent after a handoff (Module 4).
+ * Module 5: or the single Support agent that does everything.
+ */
+export type Agent = "copper" | "refund" | "support";
 
 export const AGENT_NAMES: Record<Agent, string> = {
   copper: "Copper",
   refund: "Refund agent",
+  support: "Support agent",
+};
+
+/** Module 5: two agents with a handoff (the app's default), or one agent. */
+export type AgentSetup = "two" | "one";
+
+/** The tokens, cost and time of every model call in one answer (Module 5). */
+export type Usage = {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
 };
 
 export type ThinkingStep = { type: "thinking"; text: string; agent?: Agent };
@@ -35,6 +50,9 @@ export type Progress = {
   status: "working" | "done" | "error";
   /** Who wrote the reply. Copper unless set. */
   agent?: Agent;
+  /** Module 5: what the answer cost, and its Langfuse trace (when traced). */
+  usage?: Usage;
+  traceId?: string;
 };
 
 /** Every tool call in an answer, in order. */
@@ -71,4 +89,13 @@ export const AGENT_TOOLS: Record<Agent, string[]> = {
     "search_docs",
   ],
   refund: ["get_orders", "request_refund", "transfer_to_copper"],
+  support: [
+    "get_products",
+    "get_prices",
+    "calculate_cost",
+    "check_availability",
+    "search_docs",
+    "get_orders",
+    "request_refund",
+  ],
 };

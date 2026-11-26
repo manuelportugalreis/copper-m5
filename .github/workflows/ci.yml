@@ -1,7 +1,10 @@
 name: CI
 
+# Module 5: runs on every pull request (and on main after a merge). main is
+# protected: a pull request can only merge when both jobs pass.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -23,3 +26,33 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  # The golden-set eval: both setups answer every question, an AI judge grades
+  # them, and the scores go to Langfuse and to this check's summary. Fails when
+  # the two-agent setup passes fewer than 80% of the questions.
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One eval run at a time, so a free Gemini key isn't rate limited.
+    concurrency:
+      group: evals-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run eval
+        env:
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: eval-results/
+          if-no-files-found: ignore
