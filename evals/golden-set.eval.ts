@@ -55,6 +55,22 @@ type Summary = {
 const mean = (values: number[]) =>
   values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
 
+/** Free keys sometimes hit the per-minute quota: wait it out and retry. */
+async function judgeWithRetry(
+  run: () => Promise<{ pass: boolean; reason: string }>,
+) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      const quota = /quota|rate.?limit|429|exhausted/i.test(String(error));
+      if (!quota || attempt >= 3)
+        return { pass: false, reason: `The judge failed: ${String(error)}` };
+      await new Promise((done) => setTimeout(done, 60_000));
+    }
+  }
+}
+
 /** Copies the golden set into the Langfuse dataset (same ids: an update). */
 async function syncDataset(langfuse: LangfuseClient) {
   const { GOLDEN_SET } = await import("@/lib/evals/golden-set");
@@ -147,10 +163,7 @@ async function runSetup(
         const golden = caseOf(metadata);
         const answer = output as Answer;
         const tools = checkTools(golden, answer);
-        const verdict = await judge(golden, answer).catch((error) => ({
-          pass: false,
-          reason: `The judge failed: ${String(error)}`,
-        }));
+        const verdict = await judgeWithRetry(() => judge(golden, answer));
         const passed = tools.pass && verdict.pass;
         return [
           {
@@ -279,6 +292,14 @@ describe("Ask Copper golden set", () => {
       );
       if (process.env.GITHUB_STEP_SUMMARY)
         appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${markdown}\n`);
+      // In GitHub Actions, also show each setup's scores as a notice on the
+      // pull request's checks.
+      if (process.env.GITHUB_ACTIONS)
+        for (const r of summaries)
+          process.stdout.write(
+            `::notice title=Eval scores: ${r.name}::Pass rate ${(r.passRate * 100).toFixed(0)}% (${r.passed}/${r.cases}), avg cost $${r.avgCostUsd.toFixed(5)} per answer, avg time ${r.avgLatencyS.toFixed(1)} s per answer
+`,
+          );
 
       const gate = summaries.find((s) => s.setup === GATE);
       if (gate)
