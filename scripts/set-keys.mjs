@@ -46,13 +46,21 @@ function readEnv() {
     .filter((line) => line && !line.startsWith("#") && line.includes("="))
     .map((line) => {
       const at = line.indexOf("=");
-      return [line.slice(0, at), line.slice(at + 1).replace(/^"|"$/g, "")];
-    });
+      const value = line
+        .slice(at + 1)
+        .trim()
+        .replace(/^"|"$/g, "");
+      return [line.slice(0, at).trim(), value];
+    })
+    .filter(([, value]) => value);
   return new Map(entries);
 }
 
 const env = readEnv();
-for (const key of KEYS) {
+// `npm run keys -- --github` skips the prompts: it sends the keys already in
+// .env.local (pasted there in a text editor) to the Actions secrets.
+const onlyGithub = process.argv.includes("--github");
+for (const key of onlyGithub ? [] : KEYS) {
   const current = env.get(key.name);
   const hint = current
     ? " (Enter keeps the saved one)"
@@ -64,18 +72,24 @@ for (const key of KEYS) {
   else if (!current && key.fallback) env.set(key.name, key.fallback);
 }
 
-const lines = [...env].map(([name, value]) => `${name}="${value}"`);
-writeFileSync(FILE, `${lines.join("\n")}\n`);
-console.log(`Saved in ${FILE}.`);
+if (!onlyGithub) {
+  const lines = [...env].map(([name, value]) => `${name}="${value}"`);
+  writeFileSync(FILE, `${lines.join("\n")}\n`);
+  console.log(`Saved in ${FILE}.`);
+}
 
 const missing = KEYS.filter((k) => !env.get(k.name)).map((k) => k.name);
 if (missing.length) {
-  console.log(`Still missing: ${missing.join(", ")}. Run npm run keys again.`);
+  console.log(`Still missing: ${missing.join(", ")}. Add them to ${FILE}.`);
   process.exit(1);
 }
 
+// The student's own repo (origin), not the course repo.
+const repo = spawnSync("git", ["remote", "get-url", "origin"], {
+  encoding: "utf8",
+}).stdout.trim();
 for (const { name } of KEYS) {
-  const result = spawnSync("gh", ["secret", "set", name], {
+  const result = spawnSync("gh", ["secret", "set", name, "--repo", repo], {
     input: env.get(name),
     encoding: "utf8",
     stdio: ["pipe", "ignore", "pipe"],

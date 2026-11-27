@@ -1,5 +1,11 @@
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { embedMany, generateText, Output, streamText } from "ai";
+import {
+  embedMany,
+  generateText,
+  Output,
+  streamText,
+  wrapLanguageModel,
+} from "ai";
 import type { z } from "zod";
 import {
   defaultModel,
@@ -9,7 +15,13 @@ import {
   type ModelId,
 } from "@/lib/ai/models";
 import { costUsd } from "@/lib/ai/pricing";
-import { type Observation, observe, type TraceParent } from "@/lib/ai/trace";
+import { waitForTurn } from "@/lib/ai/rate-limit";
+import {
+  type Observation,
+  observe,
+  startTracing,
+  type TraceParent,
+} from "@/lib/ai/trace";
 
 // Every model call in the app goes through this file, so each one is logged
 // with its tokens, cost and how long it took. The log goes to the terminal
@@ -75,7 +87,22 @@ function languageModel(model: ModelId) {
     entry && "googleId" in entry
       ? entry.googleId
       : model.slice("google/".length);
-  return google()(id);
+  // Each request to the model (every step of an agent) waits its turn when
+  // AI_MAX_CALLS_PER_MINUTE is set (lib/ai/rate-limit.ts, for the evals).
+  return wrapLanguageModel({
+    model: google()(id),
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: async ({ doGenerate }) => {
+        await waitForTurn();
+        return doGenerate();
+      },
+      wrapStream: async ({ doStream }) => {
+        await waitForTurn();
+        return doStream();
+      },
+    },
+  });
 }
 
 /** Prints one line per model call, so the cost and time are visible. */
@@ -173,6 +200,7 @@ async function tracked<T extends { usage: Usage; text?: string }>(
   options: Parameters<typeof inputOf>[0],
   run: (model: ModelId) => Promise<T>,
 ): Promise<T> {
+  await startTracing();
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
   const generation = startGeneration(info, model, options);
@@ -222,6 +250,7 @@ export async function callEmbedMany(
   info: Omit<CallInfo, "model">,
   values: string[],
 ) {
+  await startTracing();
   const started = performance.now();
   const embedding = observe(info.feature, "embedding", {
     model: EMBEDDING_MODEL,

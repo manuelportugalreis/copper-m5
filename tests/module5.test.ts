@@ -174,3 +174,30 @@ describe("the golden set and its hard checks (Module 5)", () => {
     expect(checkTools(golden, answer(refunded, "error")).pass).toBe(false);
   });
 });
+
+describe("the eval's rate limit (Module 5)", () => {
+  it("never waits when AI_MAX_CALLS_PER_MINUTE isn't set", async () => {
+    vi.resetModules();
+    vi.stubEnv("AI_MAX_CALLS_PER_MINUTE", "");
+    const { waitForTurn, waitedMs } = await import("@/lib/ai/rate-limit");
+    for (let i = 0; i < 50; i++) await waitForTurn();
+    expect(waitedMs()).toBe(0);
+  });
+
+  it("holds the next call once the minute's limit is used", async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    vi.stubEnv("AI_MAX_CALLS_PER_MINUTE", "2");
+    const { waitForTurn, waitedMs } = await import("@/lib/ai/rate-limit");
+    await waitForTurn();
+    await waitForTurn();
+    let third = false;
+    void waitForTurn().then(() => (third = true));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(third).toBe(false);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(third).toBe(true);
+    expect(waitedMs()).toBeGreaterThanOrEqual(60_000);
+    vi.useRealTimers();
+  });
+});

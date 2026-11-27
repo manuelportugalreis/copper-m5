@@ -12,6 +12,8 @@ import { LangfuseClient } from "@langfuse/client";
 import { describe, expect, it } from "vitest";
 
 if (existsSync(".env.local")) process.loadEnvFile(".env.local");
+// Free Gemini keys allow 15 model calls a minute: stay under it.
+process.env.AI_MAX_CALLS_PER_MINUTE ??= "13";
 
 type Setup = "two" | "one";
 type Evaluation = { name: string; value: number; comment?: string };
@@ -29,7 +31,7 @@ const SETUPS = (process.env.EVAL_AGENTS ?? "two,one")
 const GATE: Setup = "two";
 const PASS_RATE = Number(process.env.EVAL_PASS_RATE ?? "0.8");
 /** Free Gemini keys allow only a few calls at once. */
-const CONCURRENCY = Number(process.env.EVAL_CONCURRENCY ?? "2");
+const CONCURRENCY = Number(process.env.EVAL_CONCURRENCY ?? "1");
 
 const missing = [
   "GOOGLE_GENERATIVE_AI_API_KEY",
@@ -96,6 +98,7 @@ async function runSetup(
   const { toolCallsOf } = await import("@/lib/copper/assistant/progress");
   const { DEFAULT_LIMIT_USD } = await import("@/lib/copper/orders");
   const { flushTraces } = await import("@/lib/ai/trace");
+  const { waitedMs } = await import("@/lib/ai/rate-limit");
   type Answer = import("@/lib/evals/judge").Answer;
   const byId = new Map(GOLDEN_SET.map((g) => [g.id, g]));
   const caseOf = (metadata: unknown) => {
@@ -117,6 +120,7 @@ async function runSetup(
       const golden = caseOf(metadata);
       const question = (input as { question: string }).question;
       const started = performance.now();
+      const waitedBefore = waitedMs();
       const { progress } = await askCopper({
         messages: [{ role: "user", content: question }],
         useTools: true,
@@ -130,7 +134,10 @@ async function runSetup(
         status: final.status,
         tools: toolCallsOf(final),
         costUsd: final.usage?.costUsd ?? 0,
-        latencyMs: Math.round(performance.now() - started),
+        // Time spent waiting for the free key's rate limit isn't Copper's.
+        latencyMs: Math.round(
+          performance.now() - started - (waitedMs() - waitedBefore),
+        ),
         traceId: final.traceId,
       };
       return answer;
@@ -207,7 +214,12 @@ async function runSetup(
     avgCostUsd: mean(rows.map((r) => r.cost)),
     totalCostUsd: rows.reduce((sum, r) => sum + r.cost, 0),
     avgLatencyS: mean(rows.map((r) => r.latency)),
-    url: result.experimentUrl ?? result.datasetRunUrl,
+    url:
+      result.experimentUrl ??
+      result.datasetRunUrl ??
+      (result.itemResults[0]?.traceId
+        ? await langfuse.getTraceUrl(result.itemResults[0].traceId)
+        : undefined),
     failures: rows
       .filter((r) => !r.passed)
       .map(({ id, reason }) => ({ id, reason })),
@@ -248,6 +260,9 @@ describe("Ask Copper golden set", () => {
   it.skipIf(missing.length > 0)(
     `passes at least ${PASS_RATE * 100}% of the questions`,
     async () => {
+      // Start tracing first, so every experiment's traces are recorded.
+      const { startTracing } = await import("@/lib/ai/trace");
+      await startTracing();
       const langfuse = new LangfuseClient();
       const summaries: Summary[] = [];
       for (const setup of SETUPS)

@@ -16,7 +16,13 @@
 import { hasToolCall, stepCountIs } from "ai";
 import { type AiCallRow, callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
-import { flushTraces, inside, type Observation, observe } from "@/lib/ai/trace";
+import {
+  flushTraces,
+  inside,
+  type Observation,
+  observe,
+  startTracing,
+} from "@/lib/ai/trace";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
@@ -171,6 +177,9 @@ export async function askCopper({
     usage.costUsd += row.cost_usd ?? 0;
   };
   // One Langfuse trace per answer (a no-op when Langfuse isn't set up).
+  await startTracing().catch((error) =>
+    console.error("[langfuse] tracing failed to start:", error),
+  );
   const root = observe("ask-copper", "agent", {
     input: messages.at(-1)?.content,
     metadata: {
@@ -363,6 +372,9 @@ export async function askCopper({
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
       root.update({ level: "ERROR", statusMessage: String(error) });
+      process.stderr
+        .write(`ASK ERROR ${(error as Error)?.stack ?? String(error)}
+`);
     }
     for (const id of [...toolObservations.keys()]) endTool(id, "no result");
     root

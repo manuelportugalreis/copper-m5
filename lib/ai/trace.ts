@@ -2,10 +2,11 @@
 // answered, which tools it used, and the tokens, cost and time of each model
 // call. Tracing is on only when the Langfuse keys are set (LANGFUSE_PUBLIC_KEY,
 // LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL); without them the app works as before.
-import { LangfuseSpanProcessor } from "@langfuse/otel";
-import { startObservation } from "@langfuse/tracing";
+// The Langfuse and OpenTelemetry packages load only when the keys are set, so
+// they never slow down the app (or its tests) without them.
+import type { LangfuseSpanProcessor } from "@langfuse/otel";
+import type { startObservation } from "@langfuse/tracing";
 import { context, type Span, trace } from "@opentelemetry/api";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 export function isTracingConfigured(): boolean {
   return Boolean(
@@ -14,29 +15,50 @@ export function isTracingConfigured(): boolean {
   );
 }
 
-// One span processor per server process, kept on globalThis so Next.js hot
-// reloads don't register a second one.
-const KEY = Symbol.for("copper.langfuse.processor");
-type WithProcessor = typeof globalThis & {
-  [KEY]?: LangfuseSpanProcessor;
+type Tracing = {
+  processor: LangfuseSpanProcessor;
+  startObservation: typeof startObservation;
 };
 
-/** Starts sending traces to Langfuse (once). False when the keys aren't set. */
-export function startTracing(): boolean {
+// One span processor per server process, kept on globalThis so Next.js hot
+// reloads don't register a second one.
+const KEY = Symbol.for("copper.langfuse.tracing");
+const LOADED = Symbol.for("copper.langfuse.loaded");
+type WithTracing = typeof globalThis & {
+  [KEY]?: Promise<Tracing>;
+  [LOADED]?: Tracing;
+};
+const store = globalThis as WithTracing;
+
+async function load(): Promise<Tracing> {
+  const [{ LangfuseSpanProcessor }, tracing, { NodeTracerProvider }] =
+    await Promise.all([
+      import("@langfuse/otel"),
+      import("@langfuse/tracing"),
+      import("@opentelemetry/sdk-trace-node"),
+    ]);
+  // "immediate" sends each span as it ends, which suits serverless.
+  const processor = new LangfuseSpanProcessor({ exportMode: "immediate" });
+  new NodeTracerProvider({ spanProcessors: [processor] }).register();
+  const loaded = { processor, startObservation: tracing.startObservation };
+  store[LOADED] = loaded;
+  return loaded;
+}
+
+/**
+ * Starts sending traces to Langfuse (once). False when the keys aren't set.
+ * Await it before tracing: until then, observe() records nothing.
+ */
+export async function startTracing(): Promise<boolean> {
   if (!isTracingConfigured()) return false;
-  const store = globalThis as WithProcessor;
-  if (!store[KEY]) {
-    // "immediate" sends each span as it ends, which suits serverless.
-    const processor = new LangfuseSpanProcessor({ exportMode: "immediate" });
-    new NodeTracerProvider({ spanProcessors: [processor] }).register();
-    store[KEY] = processor;
-  }
+  store[KEY] ??= load();
+  await store[KEY];
   return true;
 }
 
 /** Waits until every finished span has reached Langfuse. */
 export async function flushTraces(): Promise<void> {
-  await (globalThis as WithProcessor)[KEY]?.forceFlush();
+  await store[LOADED]?.processor.forceFlush();
 }
 
 /** A Langfuse observation that other observations can nest under. */
@@ -72,9 +94,15 @@ type Kind =
   | "event"
   | "evaluator";
 
+type Start = (
+  name: string,
+  attributes: object,
+  options: { asType: Kind },
+) => Noop;
+
 /**
  * Starts an observation under `parent` (or as the start of a new trace, or
- * under the active one), or a no-op one when tracing is off.
+ * under the active one), or a no-op one when tracing is off or not started.
  */
 export function observe(
   name: string,
@@ -82,13 +110,11 @@ export function observe(
   attributes: Record<string, unknown> = {},
   parent?: TraceParent | Noop,
 ): Noop {
-  if (!startTracing()) return NOOP;
-  const start = (parent ?? { startObservation }).startObservation as (
-    name: string,
-    attributes: object,
-    options: { asType: Kind },
-  ) => Noop;
-  return start(name, attributes, { asType: kind });
+  const tracing = store[LOADED];
+  if (!tracing || !isTracingConfigured()) return NOOP;
+  // Called as a method, so the parent keeps `this` (its own span).
+  const owner = (parent ?? tracing) as { startObservation: Start };
+  return owner.startObservation(name, attributes, { asType: kind });
 }
 
 export type Observation = ReturnType<typeof observe>;
