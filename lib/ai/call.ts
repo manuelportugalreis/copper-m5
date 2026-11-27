@@ -1,5 +1,11 @@
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { embedMany, generateText, Output, streamText } from "ai";
+import {
+  embedMany,
+  generateText,
+  Output,
+  streamText,
+  wrapLanguageModel,
+} from "ai";
 import type { z } from "zod";
 import {
   defaultModel,
@@ -9,10 +15,20 @@ import {
   type ModelId,
 } from "@/lib/ai/models";
 import { costUsd } from "@/lib/ai/pricing";
+import { waitForTurn } from "@/lib/ai/rate-limit";
+import {
+  type Observation,
+  observe,
+  startTracing,
+  type TraceParent,
+} from "@/lib/ai/trace";
 
 // Every model call in the app goes through this file, so each one is logged
 // with its tokens, cost and how long it took. The log goes to the terminal
 // running the app, as a line starting "[ai_calls]".
+// Module 5: each call is also traced in Langfuse as a "generation" with its
+// model, input, output, tokens and cost (lib/ai/trace.ts), nested under the
+// agent that made it when `trace` is set.
 
 export class AiNotConfiguredError extends Error {
   constructor() {
@@ -28,7 +44,15 @@ export function isAiConfigured(): boolean {
 }
 
 /** Which module and feature made the call, for the ai_calls log. */
-export type CallInfo = { module: number; feature: string; model?: ModelId };
+export type CallInfo = {
+  module: number;
+  feature: string;
+  model?: ModelId;
+  /** Module 5: the Langfuse observation (an agent, an eval) this call belongs to. */
+  trace?: TraceParent | Observation;
+  /** Module 5: called with the ai_calls row once the call ends. */
+  onLogged?: (row: AiCallRow) => void;
+};
 
 // Omit that keeps generateText's "prompt or messages" union intact.
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
@@ -63,12 +87,88 @@ function languageModel(model: ModelId) {
     entry && "googleId" in entry
       ? entry.googleId
       : model.slice("google/".length);
-  return google()(id);
+  // Each request to the model (every step of an agent) waits its turn when
+  // AI_MAX_CALLS_PER_MINUTE is set (lib/ai/rate-limit.ts, for the evals).
+  return wrapLanguageModel({
+    model: google()(id),
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: async ({ doGenerate }) => {
+        await waitForTurn();
+        return doGenerate();
+      },
+      wrapStream: async ({ doStream }) => {
+        await waitForTurn();
+        return doStream();
+      },
+    },
+  });
 }
 
 /** Prints one line per model call, so the cost and time are visible. */
 async function logCall(row: AiCallRow): Promise<void> {
   console.info("[ai_calls]", JSON.stringify(row));
+}
+
+/** What the model was given, for the Langfuse trace. */
+function inputOf(options: {
+  instructions?: unknown;
+  prompt?: unknown;
+  messages?: unknown;
+}) {
+  return {
+    ...(options.instructions ? { instructions: options.instructions } : {}),
+    ...(options.messages
+      ? { messages: options.messages }
+      : { prompt: options.prompt }),
+  };
+}
+
+/** Starts the Langfuse generation for one model call. */
+function startGeneration(
+  info: CallInfo,
+  model: ModelId,
+  options: Parameters<typeof inputOf>[0],
+) {
+  return observe(
+    info.feature,
+    "generation",
+    {
+      model,
+      input: inputOf(options),
+      metadata: { module: info.module, feature: info.feature },
+    },
+    info.trace,
+  );
+}
+
+/** Logs the call, and ends its Langfuse generation with tokens and cost. */
+async function finish(
+  info: CallInfo,
+  generation: Observation,
+  row: AiCallRow,
+  output?: unknown,
+): Promise<void> {
+  await logCall(row);
+  info.onLogged?.(row);
+  generation
+    .update({
+      output,
+      ...(row.ok ? {} : { level: "ERROR", statusMessage: "call failed" }),
+      ...(row.input_tokens !== null && row.output_tokens !== null
+        ? {
+            usageDetails: {
+              input: row.input_tokens,
+              output: row.output_tokens,
+              total: row.input_tokens + row.output_tokens,
+            },
+          }
+        : {}),
+      ...(row.cost_usd !== null
+        ? { costDetails: { total: row.cost_usd } }
+        : {}),
+    })
+    .end();
 }
 
 type Usage = { inputTokens?: number; outputTokens?: number };
@@ -95,25 +195,31 @@ function rowFor(info: CallInfo, model: ModelId, started: number) {
   };
 }
 
-async function tracked<T extends { usage: Usage }>(
+async function tracked<T extends { usage: Usage; text?: string }>(
   info: CallInfo,
+  options: Parameters<typeof inputOf>[0],
   run: (model: ModelId) => Promise<T>,
 ): Promise<T> {
+  await startTracing();
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const generation = startGeneration(info, model, options);
   try {
     const result = await run(model);
-    await logCall(row(true, result.usage));
+    const output = (result as { output?: unknown }).output ?? result.text;
+    await finish(info, generation, row(true, result.usage), output);
     return result;
   } catch (error) {
-    if (!(error instanceof AiNotConfiguredError)) await logCall(row(false));
+    if (!(error instanceof AiNotConfiguredError))
+      await finish(info, generation, row(false), String(error));
+    else generation.end();
     throw error;
   }
 }
 
 /** Generates text. Example: callText({ module: 3, feature: "support-answer" }, { prompt }) */
 export async function callText(info: CallInfo, options: TextOptions) {
-  return tracked(info, (model) =>
+  return tracked(info, options, (model) =>
     generateText({ ...options, model: languageModel(model) }),
   );
 }
@@ -124,7 +230,7 @@ export async function callObject<Schema extends z.ZodType>(
   options: TextOptions & { schema: Schema },
 ) {
   const { schema, ...rest } = options;
-  const result = await tracked(info, (model) =>
+  const result = await tracked(info, rest, (model) =>
     generateText({
       ...rest,
       model: languageModel(model),
@@ -144,10 +250,17 @@ export async function callEmbedMany(
   info: Omit<CallInfo, "model">,
   values: string[],
 ) {
+  await startTracing();
   const started = performance.now();
+  const embedding = observe(info.feature, "embedding", {
+    model: EMBEDDING_MODEL,
+    input: values,
+    metadata: { module: info.module, feature: info.feature },
+  });
   // Google doesn't report tokens for embeddings, so tokens and cost are null.
-  const log = (ok: boolean) =>
-    logCall({
+  const log = (ok: boolean) => {
+    embedding.update({ output: `${values.length} embeddings` }).end();
+    return logCall({
       module: info.module,
       feature: info.feature,
       model: EMBEDDING_MODEL,
@@ -158,6 +271,7 @@ export async function callEmbedMany(
       ok,
       created_at: new Date().toISOString(),
     });
+  };
   try {
     const result = await embedMany({
       model: google().embedding(EMBEDDING_MODEL.slice("google/".length)),
@@ -187,11 +301,13 @@ type StreamOptions = DistributiveOmit<
 export function callStream(info: CallInfo, options: StreamOptions) {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const generation = startGeneration(info, model, options);
   return streamText({
     ...options,
     model: languageModel(model),
-    onFinish: ({ totalUsage }) => logCall(row(true, totalUsage)),
-    onError: () => logCall(row(false)),
+    onFinish: ({ totalUsage, text }) =>
+      finish(info, generation, row(true, totalUsage), text),
+    onError: ({ error }) => finish(info, generation, row(false), String(error)),
   });
 }
 

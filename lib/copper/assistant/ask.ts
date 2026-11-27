@@ -9,22 +9,38 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
+// Module 5: every answer is traced in Langfuse (lib/ai/trace.ts): one trace
+// per answer, with each agent, its tool calls and its model calls (tokens,
+// cost, time) nested inside. `agents: "one"` swaps the two agents for a single
+// Support agent with all the tools and no handoff, so evals can compare them.
 import { hasToolCall, stepCountIs } from "ai";
-import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
+import { type AiCallRow, callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
+import {
+  flushTraces,
+  inside,
+  type Observation,
+  observe,
+  startTracing,
+} from "@/lib/ai/trace";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
   REFUND_AGENT_INSTRUCTIONS,
+  SUPPORT_AGENT_INSTRUCTIONS,
 } from "@/lib/copper/assistant/instructions";
-import type {
-  Agent,
-  Progress,
-  ToolStep,
+import {
+  type Agent,
+  AGENT_NAMES,
+  type AgentSetup,
+  type Progress,
+  type ToolStep,
+  type Usage,
 } from "@/lib/copper/assistant/progress";
 import {
   copperTools,
   refundAgentTools,
+  supportAgentTools,
   transferToRefundAgent,
 } from "@/lib/copper/assistant/tools";
 import type { Desk } from "@/lib/copper/orders";
@@ -38,6 +54,10 @@ export type AskCopperRequest = {
   desk?: Desk;
   /** Who answers first: whoever ended the last turn. Copper by default. */
   agent?: Agent;
+  /** Module 5: two agents (the default) or one Support agent (COPPER_AGENTS=one). */
+  agents?: AgentSetup;
+  /** Module 5: labels for the Langfuse trace, like an eval case's name. */
+  tags?: string[];
 };
 
 export type AskCopperResult = { progress: Live<Progress> };
@@ -61,11 +81,33 @@ const STOP = [
 
 const SORRY = "Sorry, something went wrong on my end. Please try again.";
 
+/** Where each model call is traced, and who adds up its cost. */
+type Tracking = {
+  trace: Observation;
+  onLogged: (row: AiCallRow) => void;
+};
+
 /** One agent's call: its instructions and only its own tools. */
-function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
+function agentCall(
+  agent: Agent,
+  messages: ChatMessage[],
+  desk: Desk | undefined,
+  tracking: Tracking,
+) {
+  if (agent === "support" && desk)
+    return callStream(
+      { module: 5, feature: "support-agent", ...tracking },
+      {
+        messages,
+        providerOptions: THOUGHT_SUMMARIES,
+        instructions: SUPPORT_AGENT_INSTRUCTIONS,
+        tools: supportAgentTools(desk),
+        stopWhen: stepCountIs(MAX_STEPS),
+      },
+    );
   if (agent === "refund" && desk)
     return callStream(
-      { module: 4, feature: "refund-agent" },
+      { module: 4, feature: "refund-agent", ...tracking },
       {
         messages,
         providerOptions: THOUGHT_SUMMARIES,
@@ -75,7 +117,7 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
       },
     );
   return callStream(
-    { module: 2, feature: "ask-copper" },
+    { module: 2, feature: "ask-copper", ...tracking },
     {
       messages,
       providerOptions: THOUGHT_SUMMARIES,
@@ -90,25 +132,75 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
   );
 }
 
+/** COPPER_AGENTS=one makes the app use the single Support agent. */
+function defaultSetup(): AgentSetup {
+  return process.env.COPPER_AGENTS === "one" ? "one" : "two";
+}
+
+/** The first agent: the Support agent alone, or whoever ended the last turn. */
+function firstAgent(
+  setup: AgentSetup,
+  useTools: boolean,
+  desk: Desk | undefined,
+  agent: Agent,
+): Agent {
+  if (!desk || !useTools) return "copper";
+  if (setup === "one") return "support";
+  return agent === "support" ? "copper" : agent;
+}
+
+const SETUP_NAMES: Record<AgentSetup, string> = {
+  one: "one agent",
+  two: "two agents",
+};
+
 export async function askCopper({
   messages,
   useTools,
   desk,
   agent = "copper",
+  agents = defaultSetup(),
+  tags = [],
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
-  const first: Agent = desk && useTools ? agent : "copper";
+  const first = firstAgent(agents, useTools, desk, agent);
+  const usage: Usage = {
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    costUsd: 0,
+  };
+  const onLogged = (row: AiCallRow) => {
+    usage.calls++;
+    usage.inputTokens += row.input_tokens ?? 0;
+    usage.outputTokens += row.output_tokens ?? 0;
+    usage.costUsd += row.cost_usd ?? 0;
+  };
+  // One Langfuse trace per answer (a no-op when Langfuse isn't set up).
+  await startTracing().catch((error) =>
+    console.error("[langfuse] tracing failed to start:", error),
+  );
+  const root = observe("ask-copper", "agent", {
+    input: messages.at(-1)?.content,
+    metadata: {
+      agents: SETUP_NAMES[agents],
+      page: desk ? "support" : "site",
+      tags,
+    },
+  });
   const progress: Progress = {
     steps: [],
     reply: "",
     status: "working",
     agent: first,
+    ...(root.traceId ? { traceId: root.traceId } : {}),
   };
   // A fresh copy each time, so earlier updates never change underneath the
   // panel.
   const snapshot = (): Progress => ({
     ...progress,
     steps: progress.steps.map((step) => ({ ...step })),
+    usage: { ...usage },
   });
   // Tool call ids are per agent call, so each call's are kept apart.
   let call = 0;
@@ -117,11 +209,32 @@ export async function askCopper({
       (step): step is ToolStep =>
         step.type === "tool" && step.id === `${call}:${id}`,
     );
+  // Each tool call's Langfuse observation, until its result comes back.
+  const toolObservations = new Map<string, Observation>();
+
+  function startTool(
+    parent: Observation,
+    id: string,
+    name: string,
+    input: unknown,
+  ) {
+    if (!toolObservations.has(id))
+      toolObservations.set(id, observe(name, "tool", { input }, parent));
+  }
+
+  function endTool(id: string, output: unknown, error = false) {
+    toolObservations
+      .get(id)
+      ?.update({ output, ...(error ? { level: "ERROR" } : {}) })
+      .end();
+    toolObservations.delete(id);
+  }
 
   /** Reads one agent's stream into progress. Returns who to hand off to. */
   async function follow(
     current: Agent,
     result: ReturnType<typeof callStream>,
+    observation: Observation,
   ): Promise<Agent | undefined> {
     let handoff: Agent | undefined;
     for await (const part of result.fullStream) {
@@ -148,6 +261,12 @@ export async function askCopper({
           });
           break;
         case "tool-call": {
+          startTool(
+            observation,
+            `${call}:${part.toolCallId}`,
+            part.toolName,
+            part.input,
+          );
           const step = toolStep(part.toolCallId);
           if (step) step.input = part.input;
           else
@@ -162,6 +281,7 @@ export async function askCopper({
           break;
         }
         case "tool-result": {
+          endTool(`${call}:${part.toolCallId}`, part.output);
           const step = toolStep(part.toolCallId);
           if (step) Object.assign(step, { output: part.output, state: "done" });
           if (part.toolName in HANDOFF_TOOLS)
@@ -175,6 +295,7 @@ export async function askCopper({
               ? part.error.message
               : String(part.error);
           if (step) Object.assign(step, { output: message, state: "error" });
+          endTool(`${call}:${part.toolCallId}`, message, true);
           break;
         }
         case "text-delta":
@@ -190,6 +311,29 @@ export async function askCopper({
     return handoff;
   }
 
+  /** One agent's turn, traced as an agent observation under the answer. */
+  async function runAgent(current: Agent): Promise<Agent | undefined> {
+    const observation = observe(
+      AGENT_NAMES[current],
+      "agent",
+      { input: messages.at(-1)?.content },
+      root,
+    );
+    const next = await inside(observation, () =>
+      follow(
+        current,
+        agentCall(current, messages, desk, { trace: observation, onLogged }),
+        observation,
+      ),
+    );
+    observation
+      .update({
+        output: next ? `Hands off to the ${AGENT_NAMES[next]}` : progress.reply,
+      })
+      .end();
+    return next;
+  }
+
   // Read the stream in the background, so the panel gets the first update now.
   void (async () => {
     try {
@@ -199,18 +343,22 @@ export async function askCopper({
         await follow(
           "copper",
           callStream(
-            { module: 2, feature: "ask-copper" },
+            { module: 2, feature: "ask-copper", trace: root, onLogged },
             { messages, providerOptions: THOUGHT_SUMMARIES },
           ),
+          root,
         );
       } else {
         let current = first;
         for (let handoffs = 0; ; handoffs++) {
-          const next = await follow(
-            current,
-            agentCall(current, messages, desk),
-          );
+          const next = await runAgent(current);
           if (!next || next === current || handoffs >= MAX_HANDOFFS) break;
+          observe(
+            `Handoff to the ${AGENT_NAMES[next]}`,
+            "event",
+            { input: { from: AGENT_NAMES[current], to: AGENT_NAMES[next] } },
+            root,
+          );
           progress.steps.push({ type: "handoff", from: current, to: next });
           progress.agent = current = next;
           progress.reply = "";
@@ -220,11 +368,29 @@ export async function askCopper({
       }
       progress.status = "done";
       if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
+    } catch (error) {
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
+      root.update({ level: "ERROR", statusMessage: String(error) });
+      process.stderr
+        .write(`ASK ERROR ${(error as Error)?.stack ?? String(error)}
+`);
     }
+    for (const id of [...toolObservations.keys()]) endTool(id, "no result");
+    root
+      .update({
+        output: progress.reply,
+        metadata: {
+          agents: SETUP_NAMES[agents],
+          answeredBy: AGENT_NAMES[progress.agent ?? "copper"],
+          tags,
+          ...usage,
+        },
+      })
+      .end();
     done(snapshot());
+    // Send the trace before a serverless function can be frozen.
+    await flushTraces().catch(() => {});
   })();
 
   return { progress: live };
